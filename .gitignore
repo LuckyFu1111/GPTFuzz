@@ -6,3 +6,7 @@ checkpoints/
 *.log
 __pycache__/
 .vscode/
+.DS_Store
+.venv/
+.claude/
+.ipynb_checkpoints/
