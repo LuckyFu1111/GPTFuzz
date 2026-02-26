@@ -8,7 +8,7 @@ from vllm import LLM as vllm
 from vllm import SamplingParams
 from google import genai  # New Google Gen AI SDK (google-genai package)
 from google.genai import types
-from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+from anthropic import Anthropic
 
 
 class LLM:
@@ -231,7 +231,7 @@ class GeminiLLM(LLM):
     """
 
     def __init__(self,
-                 model_path='gemini-2.0-flash-exp',
+                 model_path='gemini-2.5-flash',
                  api_key=None,
                  system_message=None,
                  safety_settings=None
@@ -380,41 +380,47 @@ class GeminiLLM(LLM):
 
 class ClaudeLLM(LLM):
     def __init__(self,
-                 model_path='claude-instant-1.2',
-                 api_key=None
+                 model_path='claude-haiku-4-5-20251001',
+                 api_key=None,
+                 system_message=None
                 ):
         super().__init__()
-        
-        if len(api_key) != 108:
-            raise ValueError('invalid Claude API key')
-        
+
+        if not api_key:
+            raise ValueError('Claude API key is required')
+
         self.model_path = model_path
-        self.api_key = api_key
-        self.anthropic = Anthropic(
-            api_key=self.api_key
-        )
+        self.system_message = system_message if system_message is not None else "You are a helpful assistant."
+        self.anthropic = Anthropic(api_key=api_key)
 
-    def generate(self, prompt, max_tokens=512, max_trials=1, failure_sleep_time=1):
-        
-        for _ in range(max_trials):
-            try:
-                completion = self.anthropic.completions.create(
-                    model=self.model_path,
-                    max_tokens_to_sample=300,
-                    prompt=f"{HUMAN_PROMPT} {prompt}{AI_PROMPT}",
-                )
-                return [completion.completion]
-            except Exception as e:
-                logging.warning(
-                    f"Claude API call failed due to {e}. Retrying {_+1} / {max_trials} times...")
-                time.sleep(failure_sleep_time)
+    def generate(self, prompt, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
+        results = []
+        for _ in range(n):
+            for trial in range(max_trials):
+                try:
+                    response = self.anthropic.messages.create(
+                        model=self.model_path,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system=self.system_message,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    text = next((block.text for block in response.content if hasattr(block, 'text')), " ")
+                    results.append(text)
+                    break
+                except Exception as e:
+                    logging.warning(
+                        f"Claude API call failed due to {e}. Retrying {trial+1} / {max_trials} times...")
+                    if trial == max_trials - 1:
+                        results.append(" ")
+                    else:
+                        time.sleep(failure_sleep_time)
+        return results
 
-        return [" "]
-    
-    def generate_batch(self, prompts, max_tokens=512, max_trials=1, failure_sleep_time=1):
+    def generate_batch(self, prompts, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
         results = []
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {executor.submit(self.generate, prompt, max_tokens,
+            futures = {executor.submit(self.generate, prompt, temperature, max_tokens, n,
                                        max_trials, failure_sleep_time): prompt for prompt in prompts}
             for future in concurrent.futures.as_completed(futures):
                 results.extend(future.result())
