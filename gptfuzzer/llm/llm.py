@@ -6,8 +6,9 @@ import time
 import concurrent.futures
 from vllm import LLM as vllm
 from vllm import SamplingParams
-import google.generativeai as palm
-from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+from google import genai  # New Google Gen AI SDK (google-genai package)
+from google.genai import types
+from anthropic import Anthropic
 
 
 class LLM:
@@ -203,88 +204,223 @@ class BardLLM(LLM):
         return
 
 class PaLM2LLM(LLM):
+    """DEPRECATED: PaLM API was decommissioned on August 15, 2024.
+
+    Please migrate to GeminiLLM instead.
+    See PALM_TO_GEMINI_MIGRATION.md for detailed migration guide.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        raise DeprecationWarning(
+            "PaLM API was decommissioned on August 15, 2024. "
+            "Use GeminiLLM instead. See PALM_TO_GEMINI_MIGRATION.md for migration guide."
+        )
+
+    def generate(self, *args, **kwargs):
+        raise DeprecationWarning("PaLM API is no longer available. Use GeminiLLM.")
+
+    def generate_batch(self, *args, **kwargs):
+        raise DeprecationWarning("PaLM API is no longer available. Use GeminiLLM.")
+
+
+class GeminiLLM(LLM):
+    """Google Gemini API implementation for GPTFuzzer.
+
+    Replacement for deprecated PaLM2LLM. Supports Gemini 1.5 and 2.0 models.
+    Uses the new google-genai SDK (Client-based API).
+    """
+
     def __init__(self,
-                 model_path='chat-bison-001',
+                 model_path='gemini-2.5-flash',
+                 api_key=None,
+                 system_message=None,
+                 safety_settings=None
+                ):
+        """Initialize Gemini LLM.
+
+        Args:
+            model_path: Model name (e.g., 'gemini-2.0-flash-exp', 'gemini-1.5-flash', 'gemini-1.5-pro')
+            api_key: Google AI API key from https://aistudio.google.com/apikey
+            system_message: System instruction for the model (optional)
+            safety_settings: Optional safety settings list (e.g., ['BLOCK_NONE', 'BLOCK_NONE', ...])
+        """
+        super().__init__()
+
+        if not api_key:
+            raise ValueError(
+                'Gemini API key is required. Get one at https://aistudio.google.com/apikey'
+            )
+
+        # Create client with API key
+        self.client = genai.Client(api_key=api_key)
+        self.model_path = model_path
+        self.system_message = system_message
+
+        # Store safety settings for config (new API uses simpler string-based settings)
+        # Default to permissive settings for research purposes
+        self.safety_settings = safety_settings if safety_settings else ['BLOCK_NONE'] * 4
+
+    def __del__(self):
+        """Cleanup client connection."""
+        if hasattr(self, 'client'):
+            try:
+                self.client.close()
+            except:
+                pass
+
+    def generate(self, prompt, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
+        """Generate responses using Gemini API (new google-genai SDK).
+
+        Args:
+            prompt: Input prompt string
+            temperature: Sampling temperature (0.0 to 2.0)
+            max_tokens: Maximum output tokens
+            n: Number of candidates to generate
+            max_trials: Maximum retry attempts on failure
+            failure_sleep_time: Sleep duration between retries (seconds)
+
+        Returns:
+            List of generated text strings
+
+        Note:
+            Gemini API may block responses based on safety filters.
+            Blocked responses return empty string " ".
+        """
+        # Create generation config using new API
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            top_p=0.95,
+            top_k=40,
+            system_instruction=self.system_message if self.system_message else None,
+        )
+
+        results = []
+
+        # Generate n responses (make multiple calls if n > 1)
+        for _ in range(n):
+            for trial in range(max_trials):
+                try:
+                    # Use new client-based API
+                    response = self.client.models.generate_content(
+                        model=self.model_path,
+                        contents=prompt,
+                        config=config
+                    )
+
+                    # Extract text from response
+                    if hasattr(response, 'text') and response.text:
+                        results.append(response.text)
+                    elif hasattr(response, 'candidates') and response.candidates:
+                        # Fallback: try to extract from candidates
+                        candidate_text = str(response.candidates[0]) if response.candidates else " "
+                        results.append(candidate_text if candidate_text else " ")
+                    else:
+                        # Response blocked or empty
+                        logging.warning(f"Gemini response blocked or empty")
+                        results.append(" ")
+
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    logging.warning(
+                        f"Gemini API call failed due to {e}. "
+                        f"Retrying {trial+1} / {max_trials} times..."
+                    )
+
+                    if trial == max_trials - 1:
+                        # Max retries reached, return empty response
+                        results.append(" ")
+                    else:
+                        time.sleep(failure_sleep_time)
+
+        return results[:n]  # Ensure we return exactly n results
+
+    def generate_batch(self, prompts, temperature=0, max_tokens=512, n=1,
+                      max_trials=10, failure_sleep_time=5):
+        """Generate responses for multiple prompts concurrently.
+
+        Args:
+            prompts: List of input prompt strings
+            temperature: Sampling temperature
+            max_tokens: Maximum output tokens
+            n: Number of candidates per prompt
+            max_trials: Maximum retry attempts
+            failure_sleep_time: Sleep duration between retries
+
+        Returns:
+            List of generated text strings (flattened)
+        """
+        results = []
+
+        # Use thread pool for concurrent API calls (limit to 5 to avoid rate limits)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(
+                    self.generate,
+                    prompt,
+                    temperature,
+                    max_tokens,
+                    n,
+                    max_trials,
+                    failure_sleep_time
+                ): prompt
+                for prompt in prompts
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    results.extend(future.result())
+                except Exception as e:
+                    logging.error(f"Batch generation failed: {e}")
+                    results.extend([" " for _ in range(n)])
+
+        return results
+
+
+class ClaudeLLM(LLM):
+    def __init__(self,
+                 model_path='claude-haiku-4-5-20251001',
                  api_key=None,
                  system_message=None
                 ):
         super().__init__()
-        
-        if len(api_key) != 39:
-            raise ValueError('invalid PaLM2 API key')
-        
-        palm.configure(api_key=api_key)
-        available_models = [m for m in palm.list_models()]
-        for model in available_models:
-            if model.name == model_path:
-                self.model_path = model
-                break
-        self.system_message = system_message
-        # The PaLM-2 has a great rescriction on the number of input tokens, so I will release the short jailbreak prompts later
-        
-    def generate(self, prompt, temperature=0, n=1, max_trials=1, failure_sleep_time=1):
-        for _ in range(max_trials):
-            try:
-                results = palm.chat(
-                    model=self.model_path,
-                    prompt=prompt,
-                    temperature=temperature,
-                    candidate_count=n,
-                )
-                return [results.candidates[i]['content'] for i in range(n)]
-            except Exception as e:
-                logging.warning(
-                    f"PaLM2 API call failed due to {e}. Retrying {_+1} / {max_trials} times...")
-                time.sleep(failure_sleep_time)
 
-        return [" " for _ in range(n)]
-    
-    def generate_batch(self, prompts, temperature=0, n=1, max_trials=1, failure_sleep_time=1):
+        if not api_key:
+            raise ValueError('Claude API key is required')
+
+        self.model_path = model_path
+        self.system_message = system_message if system_message is not None else "You are a helpful assistant."
+        self.anthropic = Anthropic(api_key=api_key)
+
+    def generate(self, prompt, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
         results = []
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {executor.submit(self.generate, prompt, temperature, n,
-                                       max_trials, failure_sleep_time): prompt for prompt in prompts}
-            for future in concurrent.futures.as_completed(futures):
-                results.extend(future.result())
+        for _ in range(n):
+            for trial in range(max_trials):
+                try:
+                    response = self.anthropic.messages.create(
+                        model=self.model_path,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system=self.system_message,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    text = next((block.text for block in response.content if hasattr(block, 'text')), " ")
+                    results.append(text)
+                    break
+                except Exception as e:
+                    logging.warning(
+                        f"Claude API call failed due to {e}. Retrying {trial+1} / {max_trials} times...")
+                    if trial == max_trials - 1:
+                        results.append(" ")
+                    else:
+                        time.sleep(failure_sleep_time)
         return results
 
-class ClaudeLLM(LLM):
-    def __init__(self,
-                 model_path='claude-instant-1.2',
-                 api_key=None
-                ):
-        super().__init__()
-        
-        if len(api_key) != 108:
-            raise ValueError('invalid Claude API key')
-        
-        self.model_path = model_path
-        self.api_key = api_key
-        self.anthropic = Anthropic(
-            api_key=self.api_key
-        )
-
-    def generate(self, prompt, max_tokens=512, max_trials=1, failure_sleep_time=1):
-        
-        for _ in range(max_trials):
-            try:
-                completion = self.anthropic.completions.create(
-                    model=self.model_path,
-                    max_tokens_to_sample=300,
-                    prompt=f"{HUMAN_PROMPT} {prompt}{AI_PROMPT}",
-                )
-                return [completion.completion]
-            except Exception as e:
-                logging.warning(
-                    f"Claude API call failed due to {e}. Retrying {_+1} / {max_trials} times...")
-                time.sleep(failure_sleep_time)
-
-        return [" "]
-    
-    def generate_batch(self, prompts, max_tokens=512, max_trials=1, failure_sleep_time=1):
+    def generate_batch(self, prompts, temperature=0, max_tokens=512, n=1, max_trials=10, failure_sleep_time=5):
         results = []
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {executor.submit(self.generate, prompt, max_tokens,
+            futures = {executor.submit(self.generate, prompt, temperature, max_tokens, n,
                                        max_trials, failure_sleep_time): prompt for prompt in prompts}
             for future in concurrent.futures.as_completed(futures):
                 results.extend(future.result())
@@ -300,9 +436,9 @@ class OpenAILLM(LLM):
 
         if not api_key.startswith('sk-'):
             raise ValueError('OpenAI API key should start with sk-')
-        if model_path not in ['gpt-3.5-turbo', 'gpt-4']:
-            raise ValueError(
-                'OpenAI model path should be gpt-3.5-turbo or gpt-4')
+        # if model_path not in ['gpt-3.5-turbo', 'gpt-4']:
+        #     raise ValueError(
+        #         'OpenAI model path should be gpt-3.5-turbo or gpt-4')
         self.client = OpenAI(api_key = api_key)
         self.model_path = model_path
         self.system_message = system_message if system_message is not None else "You are a helpful assistant."
